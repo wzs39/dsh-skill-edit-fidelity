@@ -81,6 +81,8 @@ def build_args(stage, target, args):
         a = [t]
         if args.before:
             a += ["--before", args.before]
+        if args.script_body:
+            a.append("--script-body")
         if args.strict:
             a.append("--strict")
         return a
@@ -96,6 +98,8 @@ def main(argv=None):
     ap.add_argument("--char-mode", choices=["code", "text", "auto"], default="auto")
     ap.add_argument("--only", help="只跑指定闸, 逗号分隔: char,enc,guard,deps")
     ap.add_argument("--skip", help="跳过指定闸, 逗号分隔")
+    ap.add_argument("--script-body", action="store_true",
+                    help="按函数体校验 JS（workflow 脚本顶层有 return，直接 node --check 会报 Illegal return）")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="只打印汇总, 不打印各闸明细")
     ap.add_argument("--json", action="store_true")

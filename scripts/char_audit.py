@@ -229,6 +229,27 @@ MASK_STRING = 1
 MASK_COMMENT = 2
 
 
+REGEX_PREV = set("=(,:[!&|?{};+-*%<>~^")
+REGEX_WORDS = ("return", "typeof", "case", "in", "of", "delete", "void", "new", "do", "else")
+
+
+def regex_allowed(text, i):
+    """判断 text[i] 处的 / 是不是正则字面量开头（而不是除号）。"""
+    j = i - 1
+    while j >= 0 and text[j] in " 	":
+        j -= 1
+    if j < 0:
+        return True
+    if text[j] in REGEX_PREV:
+        return True
+    if text[j].isalnum() or text[j] in "_$":
+        for w in REGEX_WORDS:
+            if text[: j + 1].endswith(w):
+                return True
+        return False
+    return False
+
+
 def lex_mask(text, ext):
     """给每个字符标出 代码/字符串/注释。返回与 text 等长的列表。
 
@@ -276,6 +297,32 @@ def lex_mask(text, ext):
             mask[i + 1] = MASK_COMMENT
             state = MASK_COMMENT
             i += 2
+            continue
+        if slash_c and ch == "/" and regex_allowed(text, i):
+            # 正则字面量：/[^\s"'`，。；、）)]+/ 这类字符类里可以有引号与反引号，
+            # 不跳过就会把整个文件后续掩码带偏。正文按字面量处理（内容不是语法）。
+            j = i + 1
+            in_class = False
+            while j < n:
+                cj = text[j]
+                if cj == chr(92) and j + 1 < n:
+                    mask[j] = MASK_STRING
+                    mask[j + 1] = MASK_STRING
+                    j += 2
+                    continue
+                if cj == chr(10):
+                    break
+                mask[j] = MASK_STRING
+                if in_class:
+                    if cj == "]":
+                        in_class = False
+                elif cj == "[":
+                    in_class = True
+                elif cj == "/":
+                    j += 1
+                    break
+                j += 1
+            i = j
             continue
         if ch in (chr(34), chr(39), chr(96)):
             q3 = text[i:i + 3]

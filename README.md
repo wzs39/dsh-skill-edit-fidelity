@@ -108,7 +108,10 @@ python scripts/audit_all.py target.py --before target.py.before
 python scripts/audit_all.py target.py --strict    # WARN 也算失败
 python scripts/audit_all.py target.py --only char # 只跑字符层
 python scripts/audit_all.py target.py --json      # 机器可读
+python scripts/audit_all.py task.mjs --script-body # 顶层含 return 的 JS
 ```
+
+`--script-body` 用于 workflow 脚本、函数体片段这类**顶层有 `return`** 的 JS。直接 `node --check` 必报 `Illegal return statement`；加这个开关后包成 `async function __script_body__(){...}` 再校验，报错路径显示为 `<script-body>`。
 
 ### 单闸
 
@@ -185,6 +188,38 @@ python scripts/enc_env.py --scan scripts
 
 ---
 
+## 检查器自身的失败模式
+
+**这一节比前面所有内容都重要。** 下面的四条全是实测撞出来的——检查器自己的词法器不完整，会给出成百上千条误报，然后你去改本来正确的代码。
+
+| 编号 | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| L1 | 满屏 `FULLWIDTH` / `QUOTE` 告警，全在中文字符串里 | 词法器不认正则字面量。`/[^\s"'` + 反引号 + `，。；、）)]+/` 这类字符类里含引号，被当成字符串开头，**后续整个文件的掩码全部错位** | 加 `regex_allowed()`：回看前一有效字符（`=(,:[!&|?{};+-*%<>~^`）或关键字（`return`/`typeof`/`case`/`in`/`of`/`delete`/`void`/`new`/`do`/`else`）判定，正则正文按字面量标 |
+| L2 | `多余的 }`、`未闭合符号`，行号指向空白行 | 多行反引号模板在换行处被截断，模板正文当代码扫；`/* */` 块注释没跳过 | 反引号跨行继续（`line += 1`）；`/*` 找 `*/` 并累加行号 |
+| L3 | 语法检查明明通过，结构闸还报不配平 | 逐字符扫描器追不全 JS 语法，却去否决真解析器 | **启发式不许否决解析器**：`ok is True` 时降 `INFO` 并注明「语法已通过，判为扫描器误判」，只有无解析器或解析失败才 `FAIL` |
+| L4 | 检查器自己被抓：`PLACEHOLDER_RE = /…\|TODO\|…/` 报占位符；`except: pass` 报 stub | 自指误报——检测逻辑里必然含它要检测的字面量 | 词表/定义行自动跳过；`guard:ignore` 写在目标行本身 |
+
+**实测代价**：L1 一次产生 **482 条** FULLWIDTH 误报；L2 让一个 974 行、语法完全正确的 workflow 脚本被判 FAIL，行号从 672 追到 690 才收敛。
+
+### 判定顺序（踩过两次）
+
+1. **注释先判，正则后判。** 反过来 `//` 会被当正则开头，一路吞到下一个 `/`，整段括号算错。
+2. **字符串先判，正则后判。** 字符串里的 `/` 不是正则。
+3. **语法结果最后用**，用它决定配平告警的严重度。
+
+### 怎么发现检查器错了
+
+- 造**正负控制样本**：一个确定干净的、一个确定坏的。两边结论都对，才谈得上判中间态。
+- 同一文件换模式（`--mode code` / `text`）看结论是否翻转。翻转说明判据依赖模式而非事实。
+- **语法通过但结构告警 → 优先怀疑扫描器**，不是代码。
+- 告警集中在某一类字符、某一段区间 → 多半是掩码从那里开始错位。
+
+### 为什么误报比漏报更伤
+
+漏报你还知道自己没查；误报会让你去改本来对的代码，而且改完还是红的，于是开始怀疑整个工具。宁可漏报不误报——这条写在代码里，也写在这份文档里。
+
+---
+
 ## 设计取舍
 
 **全角标点要看词法位置。** 中文注释里的 `，。：` 是正常写作，代码位置才是缺陷。`char_audit.py` 用 `lex_mask()` 逐字符标出 代码/字符串/注释：注释内降为 `info`；字符串内只有 `FULLWIDTH` / `QUOTE` 降级——`U+200B` 在字符串里恰恰是真 bug，必须保留 `HIGH`。
@@ -220,9 +255,10 @@ scripts/write_exact.py       PASS
 ## 局限
 
 - 层 C 七类语义缺陷**无法用本项目判定**，只能靠变异测试、真值表、race detector。
-- `char_audit.py` 的 `lex_mask()` 是轻量词法扫描，不做完整语法解析；嵌套模板字符串等边界情况可能判错，宁可漏报不误报。
+- `char_audit.py` 的 `lex_mask()` 是轻量词法扫描，不做完整语法解析。已知边界：正则字面量（已用 `regex_allowed()` 缓解）、嵌套模板字符串、JSX。宁可漏报不误报，详见「检查器自身的失败模式」。
 - `dep_check.py` 只查 Python / Node；其他语言按需扩展。
 - `edit_guard.py` 的 `LOST_DEF` 依赖 `--before` 快照，没有快照时该闸不生效。
+- `edit_guard.py` 的 `BALANCE` 在语法检查已通过时降为 `INFO`——它不再否决真解析器，代价是纯扫描能力弱化。这是刻意的。
 
 ---
 

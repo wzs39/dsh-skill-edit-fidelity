@@ -78,8 +78,13 @@ def detect_lang(path: pathlib.Path, forced):
     return LANG_BY_EXT.get(path.suffix.lower(), "text")
 
 
-def parse_check(text, lang, path):
-    """真解析。返回 (ok, detail)。"""
+def parse_check(text, lang, path, script_body=False):
+    """真解析。返回 (ok, detail)。
+
+    script_body=True 时按「函数体」校验 JS：workflow 脚本、eval 片段、
+    Function 构造体都允许顶层 return，直接 node --check 会假报
+    Illegal return statement。包一层 async function 再检。
+    """
     if lang == "py":
         import ast
 
@@ -104,13 +109,54 @@ def parse_check(text, lang, path):
         node = shutil.which("node")
         if not node:
             return None, "node not found"
-        r = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
-        return (r.returncode == 0), (r.stderr.strip()[:400] or "node --check ok")
+        target = path
+        tmp = None
+        if script_body:
+            tmp = pathlib.Path(tempfile.mkstemp(suffix=".mjs")[1])
+            tmp.write_text("async function __script_body__() {\n" + text + "\n}\n", encoding="utf-8")
+            target = tmp
+        try:
+            r = subprocess.run([node, "--check", str(target)], capture_output=True, text=True)
+            err = r.stderr.strip()[:400]
+            if script_body and tmp is not None:
+                err = err.replace(str(tmp), "<script-body>")
+            return (r.returncode == 0), (err or "node --check ok")
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass  # guard:ignore
     return None, "no parser for " + lang
 
 
+REGEX_PREV = set("=(,:[!&|?{};+-*%<>~^")
+
+
+def _regex_allowed(text, i):
+    """判断 text[i] 处的 / 是否开启正则字面量（而不是除号）。"""
+    j = i - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    if j < 0:
+        return True
+    if text[j] in REGEX_PREV:
+        return True
+    # return / typeof / case / in / of / delete / void / new 之后
+    k = j
+    while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+        k -= 1
+    word = text[k + 1 : j + 1]
+    return word in ("return", "typeof", "case", "in", "of", "delete", "void", "new", "do", "else")
+
+
 def balance_scan(text, lang):
-    """逐字符扫描，跳过字符串/注释，返回未闭合栈与首处可疑行号。"""
+    """逐字符扫描，跳过字符串/注释/正则字面量，返回未闭合栈与首处可疑行号。
+
+    md/text 不参与配平：没有解析器，散文里的括号与 URL 里的 // 都不是代码。
+    """
+    if lang in ("md", "text"):
+        return {"ok": True, "unclosed": [], "line": None}
     line_comments = ("#",) if lang in ("py", "sh") else ("//",)
     pairs = {")": "(", "]": "[", "}": "{"}
     stack = []
@@ -136,6 +182,7 @@ def balance_scan(text, lang):
                 i = (end + 3) if end != -1 else n
                 continue
             j = i + 1
+            multiline = q == "`" and lang == "js"   # 模板字面量可跨行
             while j < n:
                 if text[j] == BS:
                     j += 2
@@ -143,13 +190,45 @@ def balance_scan(text, lang):
                 if text[j] == q:
                     break
                 if text[j] == chr(10):
-                    break
+                    if not multiline:
+                        break
+                    line += 1
                 j += 1
             i = j + 1
+            continue
+        if lang == "js" and text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end == -1:
+                i = n
+            else:
+                line += text.count(chr(10), i, end)
+                i = end + 2
             continue
         if any(text.startswith(lc, i) for lc in line_comments):
             end = text.find(chr(10), i)
             i = n if end == -1 else end
+            continue
+        # 正则字面量：/.../ 里可以有 ()[]{} 与未转义的 /（字符类内）
+        if c == "/" and lang == "js" and _regex_allowed(text, i):
+            j = i + 1
+            in_class = False
+            while j < n:
+                ch = text[j]
+                if ch == BS:
+                    j += 2
+                    continue
+                if ch == chr(10):
+                    break
+                if in_class:
+                    if ch == "]":
+                        in_class = False
+                elif ch == "[":
+                    in_class = True
+                elif ch == "/":
+                    j += 1
+                    break
+                j += 1
+            i = j
             continue
         if c in "([{":
             stack.append((c, line))
@@ -228,6 +307,8 @@ def main() -> int:
     ap.add_argument("--lang", default="auto")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--script-body", action="store_true",
+                    help="按函数体校验 JS（允许顶层 return）：workflow 脚本、eval/Function 片段")
     a = ap.parse_args()
 
     after = pathlib.Path(a.after)
@@ -246,7 +327,7 @@ def main() -> int:
         add("FAIL", "TRUNCATE", "文件为空或只有空白")
         text = ""
 
-    ok, detail = parse_check(text, lang, after)
+    ok, detail = parse_check(text, lang, after, script_body=a.script_body)
     if ok is False:
         add("FAIL", "SYNTAX", detail)
     elif ok is None:
@@ -254,11 +335,17 @@ def main() -> int:
 
     bal = balance_scan(text, lang)
     if not bal.get("ok", True):
+        # 真解析器已经通过 = 括号确实配平，此处只是扫描器的误判（正则/模板/块注释
+        # 这类语法，逐字符扫描器永远追不全）。启发式不许否决解析器，降为 INFO。
+        level = "INFO" if ok is True else "FAIL"
         if bal.get("unmatched_close"):
-            add("FAIL", "BALANCE", "多余的 " + bal["unmatched_close"] + "（第 " + str(bal["line"]) + " 行）")
+            msg = "多余的 " + bal["unmatched_close"] + "（第 " + str(bal["line"]) + " 行）"
+            add(level, "BALANCE", msg if level == "FAIL" else msg + "（语法已通过，判为扫描器误判）")
         else:
             opens = ", ".join(x[0] + "@L" + str(x[1]) for x in bal.get("unclosed", []))
-            add("FAIL", "BALANCE", "未闭合符号：" + (opens or "?"), [x[1] for x in bal.get("unclosed", [])])
+            msg = "未闭合符号：" + (opens or "?")
+            add(level, "BALANCE", msg if level == "FAIL" else msg + "（语法已通过，判为扫描器误判）",
+                [x[1] for x in bal.get("unclosed", [])])
 
     lines = text.split(chr(10))
     last = ""

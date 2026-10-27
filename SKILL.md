@@ -123,6 +123,10 @@ F1 的层归因（哪一层吃掉的）：
 16. **交付前四道闸全过**：字节 → 字符 → 结构 → 依赖。只过语法只能证明"没截断"。
 17. **层 C 的东西不靠声明，靠证伪**：说"逻辑对"要有负例测试；说"测试有效"要有变异分数；说"并发安全"要有 `-race` 与 goroutine 计数。
 18. **脚本对反斜杠字符本身零字面量**：需要反斜杠字符时用 `chr(92)`；正则里的 `[ \t]` 属于单层转义，保留。这样脚本不会被转义层破坏，可当参考实现。
+19. **改完脚本要真跑一次 `--help`**：`py_compile` 只查语法，查不出模块级运行时错误。实测 `set(...) + {""}` 语法完全合法，一 import 就 `TypeError: unsupported operand type(s) for +: 'set' and 'set'`。
+20. **检查器报错先怀疑检查器**：语法已通过时，配平、占位符、全角标点这类告警多半是词法器误判，不是代码错。见第 12 节。
+21. **字节判据不用 shell 转义**：`grep -c $'\r'` 在部分 shell 里被当成字面 `r`，返回等于总行数的假阳性。数 `\r\n` 一律用 Python 读 bytes。
+22. **工具不能自带它要检查的缺陷**：一个查混合换行的仓库，`.gitattributes` 必须写 `* text=auto eol=lf`，否则 `core.autocrlf` 把工作树转成 CRLF，工具自己先犯它要查的病。
 
 ## 4. 通道选择矩阵
 
@@ -273,20 +277,56 @@ mutmut run / go-mutesting / stryker run      # F15：mutation score
 - **"乱码文件转成 UTF-8 就好"**：`ä¸­æ–‡` 这类要 `--repair-mojibake`；含 U+FFFD 替换符的字节已丢，转不回来。（本文档刻意不嵌入那个字形本身——否则检查器会把文档自己判成 mojibake。）
 - **"重复代码是巧合"**：连续 5 行完全一致几乎只有"写两遍"一种来源。
 - **"代码好看就是写得好"**：语法优雅是 token 概率产物。先看边界、空值、错误路径。
+- **"检查器报错就是代码错"**：先看第 12 节。实测一次 482 条 FULLWIDTH 告警全是误报，根因是词法器不认正则字面量里的反引号。
+- **"扫描器说括号不配平就是真不配平"**：`node --check` / `python -c compile` 通过就必然配平。扫描器错，不是代码错。
+- **"占位符告警就是没写完"**：检查器自己的检测逻辑里必然含 `TODO` 这类字面量，会被自己抓到。看行内容再判。
+- **"py_compile 过了脚本就能跑"**：只查语法。`set(...) + {...}` 语法合法，一 import 就 TypeError。
+- **"grep 数换行能验 LF"**：`grep -c $'\r'` 在部分 shell 里把 `$'\r'` 当字面 `r`，返回等于总行数的假阳性。用 Python 读 bytes 数 `\r\n`。
 
 ## 11. 脚本
 
 | 脚本 | 层 | 作用 |
 | --- | --- | --- |
-| `scripts/audit_all.py` | 汇总 | 一次跑 char/enc/guard/deps 四闸，统一 verdict；`--before` / `--only` / `--skip` / `--strict` / `--json` |
+| `scripts/audit_all.py` | 汇总 | 一次跑 char/enc/guard/deps 四闸，统一 verdict；`--before` / `--only` / `--skip` / `--strict` / `--json` / `--script-body` |
 | `scripts/bs_audit.py` | A | 反斜杠总数/成对/单发、逐行计数、CRLF/BOM/尾换行、sha256；`--expect` / `--has-literal` |
 | `scripts/char_audit.py` | A | 不可见字符、双向控制符、同形字、全角标点、弯引号、混合换行、混合缩进、控制字符；`--fix` / `--fix-confusables` / `--mode` / `--recursive` |
 | `scripts/enc_audit.py` | A | BOM / UTF-16 / 严格 UTF-8 / GB18030 判定、mojibake 桥接自检、U+FFFD 检测；`--fix` / `--repair-mojibake` |
 | `scripts/enc_env.py` | A | console code page、`stdout.encoding`、`PYTHONUTF8` 等；`--scan DIR` 找缺 UTF-8 修正的脚本 |
-| `scripts/edit_guard.py` | B | SYNTAX、BALANCE、TRUNCATE、LOST_DEF、PLACEHOLDER、DUP_BLOCK、ENCODING、SHRINK |
+| `scripts/edit_guard.py` | B | SYNTAX、BALANCE、TRUNCATE、LOST_DEF、PLACEHOLDER、DUP_BLOCK、ENCODING、SHRINK；`--script-body` |
 | `scripts/dep_check.py` | B | Python `import` 可解析性、Node 相对路径与裸包存在性 |
 | `scripts/write_exact.py` | — | 无转义写入：`--b64` / `--b64-file` / `--from-file`，输出 sha256 |
 
-`edit_guard.py` 行内加 `guard:ignore` 可抑制该行的占位符判定（用于文档、词表、检查器自身）。
+`edit_guard.py` 行内加 `guard:ignore` 可抑制该行的占位符判定（用于文档、词表、检查器自身）。**注释必须写在被抑制的那一行本身**——写在 `except` 行对下一行的 `pass` 无效。
+
+`--script-body`：顶层含 `return` 的 JS（workflow 脚本、函数体片段）直接 `node --check` 必报 `Illegal return statement`。加这个开关会把内容包成 `async function __script_body__(){...}` 再校验，报错路径显示为 `<script-body>`。
+
+```bash
+python $S/audit_all.py scripts/task.workflow.mjs --script-body
+```
 
 八个脚本需要反斜杠字符时一律用 `chr(92)`，统一 UTF-8 输出（Windows 控制台不再乱码），可 `py_compile` 自检；对自身跑 `edit_guard.py --strict` 全部 PASS。
+
+## 12. 检查器自身的失败模式
+
+这些是实测撞出来的。检查器给 FAIL 时，先按本节排除它自己错，再去改代码。
+
+| 编号 | 症状 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| L1 | 满屏 FULLWIDTH / QUOTE 告警，全在中文字符串里 | 词法器不认正则字面量。`/[^\s"'` + 反引号 + `，。；、）)]+/` 这类字符类里含引号，被当成字符串开头，**后续整文件掩码错位** | 加 `regex_allowed()`：回看前一有效字符（`=(,:[!&|?{};+-*%<>~^`）或关键字（`return`/`typeof`/`case`/`in`/`of`/`delete`/`void`/`new`/`do`/`else`）判定，正则正文按字面量标 |
+| L2 | `多余的 }`、`未闭合符号`，行号指向空白行 | 多行反引号模板在换行处被截断，模板正文当代码扫；`/* */` 块注释没跳过 | 反引号跨行继续（`line += 1`）、`/*` 找 `*/` 并累加行号 |
+| L3 | 语法检查明明通过，结构闸还报不配平 | 逐字符扫描器追不全 JS 语法，却去否决真解析器 | **启发式不许否决解析器**：`ok is True` 时降 INFO 并注明「语法已通过，判为扫描器误判」，只有无解析器或解析失败才 FAIL |
+| L4 | 检查器自己被抓：`PLACEHOLDER_RE = /…|TODO|…/` 报占位符；`except: pass` 报 stub | 自指误报——检测逻辑里必然含它要检测的字面量 | 词表/定义行自动跳过；`guard:ignore` 写在目标行本身 |
+
+**判定顺序**（L1 那条踩过两次）：
+1. 注释先判，正则后判。反过来 `//` 会被当正则开头，一路吞到下一个 `/`，整段括号算错。
+2. 字符串先判，正则后判。字符串里的 `/` 不是正则。
+3. 语法结果最后用，用来决定配平告警的严重度。
+
+**怎么发现检查器错了**：
+- 造正负控制样本：一个确定干净的、一个确定坏的。两边结论都对，才谈得上判中间态。
+- 同一文件换模式（`--mode code` / `text`）看结论是否翻转。翻转说明判据依赖模式而非事实。
+- 语法通过但结构告警 → 优先怀疑扫描器，不是代码。
+- 告警集中在某一类字符、某一段区间 → 多半是掩码从那里开始错位。
+
+**这条经验是通用的**：任何"我写了个检查器"的场合，先问它认不认正则、模板、块注释、注释里的引号。词法器不完整时，误报比漏报更伤——漏报你还知道自己没查，误报会让你去改本来对的代码。
+
