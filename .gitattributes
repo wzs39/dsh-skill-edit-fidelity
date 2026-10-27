@@ -1,0 +1,4 @@
+# 全部文本按 LF 存、按 LF 出。检查换行的工具自己不能带 CRLF。
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
